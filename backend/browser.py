@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -55,6 +56,7 @@ class Browser:
         self.browser = None
         self.context = None
         self.page = None
+        self._headless: bool | None = None
         self.last_inspection: dict | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
@@ -63,35 +65,47 @@ class Browser:
     def is_running(self) -> bool:
         return self.page is not None and not self.page.is_closed()
 
-    async def start(self) -> None:
-        async with self._lifecycle_lock:
-            if self.is_running:
-                return
-            if self.playwright or self.browser or self.context:
-                await self._close_resources()
+    @property
+    def is_headless(self) -> bool | None:
+        return self._headless if self.is_running else None
 
-            try:
-                self.playwright = await async_playwright().start()
-                self.browser = await self.playwright.chromium.launch(headless=True)
-                self.context = await self.browser.new_context()
-                self.page = await self.context.new_page()
-                self.last_inspection = None
-            except Exception as exc:
-                try:
+    async def start(self, *, headless: bool = True) -> None:
+        async with self._operation_lock:
+            async with self._lifecycle_lock:
+                if self.is_running and self._headless == headless:
+                    return
+                if self.playwright or self.browser or self.context:
                     await self._close_resources()
-                except BrowserError as cleanup_error:
-                    logger.error("Browser startup cleanup failed (%s)", type(cleanup_error).__name__)
-                if not isinstance(exc, PlaywrightError):
-                    raise
-                logger.warning("Browser startup failed: %s", type(exc).__name__)
-                raise BrowserError(
-                    "Could not start Chromium. Install the Playwright browser with "
-                    "`python -m playwright install chromium` and check system dependencies."
-                ) from exc
+
+                try:
+                    self.playwright = await async_playwright().start()
+                    self.browser = await self.playwright.chromium.launch(headless=headless)
+                    self.context = await self.browser.new_context()
+                    self.page = await self.context.new_page()
+                    self._headless = headless
+                    self.last_inspection = None
+                except Exception as exc:
+                    try:
+                        await self._close_resources()
+                    except BrowserError as cleanup_error:
+                        logger.error("Browser startup cleanup failed (%s)", type(cleanup_error).__name__)
+                    if not isinstance(exc, PlaywrightError):
+                        raise
+                    logger.warning("Browser startup failed: %s", type(exc).__name__)
+                    if not headless:
+                        raise BrowserError(
+                            "Could not open a visible Chromium window. Check that this app is running "
+                            "in your desktop session and Playwright's Chromium is installed."
+                        ) from exc
+                    raise BrowserError(
+                        "Could not start Chromium. Install the Playwright browser with "
+                        "`python -m playwright install chromium` and check system dependencies."
+                    ) from exc
 
     async def _close_resources(self) -> None:
         context, chromium, playwright = self.context, self.browser, self.playwright
         self.context = self.browser = self.playwright = self.page = None
+        self._headless = None
         self.last_inspection = None
         errors: list[Exception] = []
         for resource in (context, chromium, playwright):
@@ -141,6 +155,19 @@ class Browser:
                 ) from exc
             except PlaywrightError as exc:
                 logger.warning("Navigation failed (%s)", type(exc).__name__)
+                error_code = re.search(r"net::(ERR_[A-Z0-9_]+)", str(exc))
+                if error_code:
+                    code = error_code.group(1)
+                    if code == "ERR_CONNECTION_RESET":
+                        raise BrowserError(
+                            f"Chromium could not connect to {_safe_url(url)} "
+                            "(ERR_CONNECTION_RESET). Check your internet connection, "
+                            "firewall, or network restrictions."
+                        ) from exc
+                    raise BrowserError(
+                        f"Chromium could not load {_safe_url(url)} ({code}). "
+                        "Check the address and network connection."
+                    ) from exc
                 raise BrowserError(
                     f"Could not navigate to {_safe_url(url)}. Check the address and network connection."
                 ) from exc
@@ -251,6 +278,7 @@ class Browser:
         ):
             raise ValueError("Sign-in is restricted to the confirmed Progrentis HTTPS origin.")
 
+        stage = "examining the sign-in form"
         try:
             form = await self.page.evaluate(
                 """() => {
@@ -313,22 +341,32 @@ class Browser:
                 raise BrowserError(
                     "The login form submits to a different website origin; credentials were not entered."
                 )
+            stage = "entering the username"
             await self.page.locator("input").nth(form["usernameIndex"]).fill(username)
+            stage = "entering the password"
             await self.page.locator("input").nth(form["passwordIndex"]).fill(password)
+            stage = "submitting the sign-in form"
             await self.page.locator(form["submitSelector"]).nth(form["submitIndex"]).click(timeout=5000)
+            stage = "waiting for the sign-in page to respond"
             try:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
             except PlaywrightTimeoutError:
                 await self.page.wait_for_timeout(750)
+            stage = "checking the page after submission"
+            observation = await self._inspect_page()
         except (BrowserError, ValueError):
             raise
         except PlaywrightError as exc:
-            logger.warning("Progrentis login flow failed (%s)", type(exc).__name__)
+            logger.warning(
+                "Progrentis login flow failed during %s (%s)",
+                stage,
+                type(exc).__name__,
+            )
             raise BrowserError(
-                "Could not complete the login form. Inspect the page and verify its fields manually."
+                f"Could not complete the login form while {stage}. "
+                "Inspect the page and verify its fields manually."
             ) from exc
 
-        observation = await self._inspect_page()
         return {
             "status": "form_submitted",
             "message": "The login form was submitted. Authentication success has not been assumed.",

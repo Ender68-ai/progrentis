@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -6,9 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import httpx
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from backend import agent, config, inference, tools
+from backend import agent, config, inference, main, tools
 from backend.browser import Browser, BrowserError
 
 
@@ -74,9 +76,10 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_start_is_idempotent_and_shutdown_closes_resources(self):
         page = FakePage()
         context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
-        chromium = SimpleNamespace(launch=AsyncMock(return_value=SimpleNamespace(
+        chromium_instance = SimpleNamespace(
             new_context=AsyncMock(return_value=context), close=AsyncMock()
-        )))
+        )
+        chromium = SimpleNamespace(launch=AsyncMock(return_value=chromium_instance))
         playwright = SimpleNamespace(chromium=chromium, stop=AsyncMock())
         with patch("backend.browser.async_playwright", return_value=SimpleNamespace(start=AsyncMock(return_value=playwright))):
             instance = Browser()
@@ -84,10 +87,43 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             await instance.start()
             self.assertTrue(instance.is_running)
             chromium.launch.assert_awaited_once()
+            self.assertTrue(instance.is_headless)
             await instance.stop()
         context.close.assert_awaited_once()
         playwright.stop.assert_awaited_once()
         self.assertFalse(instance.is_running)
+        self.assertIsNone(instance.is_headless)
+
+    async def test_browser_can_switch_between_visible_and_headless_modes(self):
+        pages = [FakePage(), FakePage()]
+        contexts = [
+            SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock())
+            for page in pages
+        ]
+        browsers = [
+            SimpleNamespace(
+                new_context=AsyncMock(return_value=context), close=AsyncMock()
+            )
+            for context in contexts
+        ]
+        chromium = SimpleNamespace(
+            launch=AsyncMock(side_effect=browsers)
+        )
+        playwright = SimpleNamespace(chromium=chromium, stop=AsyncMock())
+        with patch(
+            "backend.browser.async_playwright",
+            return_value=SimpleNamespace(start=AsyncMock(return_value=playwright)),
+        ):
+            instance = Browser()
+            await instance.start(headless=True)
+            await instance.start(headless=False)
+        self.assertEqual(
+            [call.kwargs["headless"] for call in chromium.launch.await_args_list],
+            [True, False],
+        )
+        self.assertFalse(instance.is_headless)
+        contexts[0].close.assert_awaited_once()
+        self.assertTrue(instance.is_running)
 
     async def test_navigation_and_page_inspection_return_visible_observations(self):
         instance = Browser()
@@ -104,6 +140,15 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         instance.page = FakePage()
         instance.page.goto_error = PlaywrightTimeoutError("timed out")
         with self.assertRaisesRegex(BrowserError, "Navigation timed out"):
+            await instance.navigate("https://example.test/")
+
+    async def test_navigation_connection_reset_explains_network_failure(self):
+        instance = Browser()
+        instance.page = FakePage()
+        instance.page.goto_error = PlaywrightError(
+            "Page.goto: net::ERR_CONNECTION_RESET at https://example.test/"
+        )
+        with self.assertRaisesRegex(BrowserError, "ERR_CONNECTION_RESET.*firewall"):
             await instance.navigate("https://example.test/")
 
     async def test_inspection_redacts_account_values(self):
@@ -211,6 +256,63 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_endpoint_emits_tokens_then_completion(self):
+        state = SimpleNamespace(agent_task=None, last_error=None)
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+        async def fake_run_agent(_prompt, _history, on_token):
+            await on_token("Hello")
+            return agent.AgentResult("Hello!", [], 1, 0)
+
+        with patch.object(main, "run_agent", side_effect=fake_run_agent):
+            response = await main.agent_run_stream(
+                main.AgentRequest(prompt="Say hello"),
+                request,
+            )
+            chunks = [
+                chunk.decode() if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        events = [json.loads(chunk) for chunk in chunks]
+        self.assertEqual(events[0], {"type": "token", "content": "Hello"})
+        self.assertEqual(events[1]["type"], "complete")
+        self.assertEqual(events[1]["result"]["response"], "Hello!")
+        self.assertIsNone(state.agent_task)
+
+    async def test_agent_includes_recent_chat_history(self):
+        chat = AsyncMock(return_value={"role": "assistant", "content": "I remember."})
+        with (
+            patch.object(agent, "browser", SimpleNamespace(is_running=True, last_inspection=None)),
+            patch.object(agent, "chat_completion", new=chat),
+        ):
+            result = await agent.run_agent(
+                "What did I just ask?",
+                [{"role": "user", "content": "Say hello."},
+                 {"role": "assistant", "content": "Hello!"}],
+            )
+        self.assertEqual(result.response, "I remember.")
+        messages = chat.await_args.args[0]
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in messages[1:]],
+            [
+                ("user", "Say hello."),
+                ("assistant", "Hello!"),
+                ("user", "What did I just ask?"),
+                ("assistant", "I remember."),
+            ],
+        )
+
+    async def test_agent_refuses_to_click_and_does_not_call_model(self):
+        chat = AsyncMock()
+        with (
+            patch.object(agent, "browser", SimpleNamespace(is_running=True, last_inspection=None)),
+            patch.object(agent, "chat_completion", new=chat),
+        ):
+            result = await agent.run_agent("Click it and return the page contents.")
+        self.assertIn("Click it yourself in the visible Chromium window", result.response)
+        chat.assert_not_awaited()
+
     async def test_multiple_tool_calls_return_observations_to_the_model(self):
         observations = [
             {"source": "browser_observation", "title": "One"},
@@ -346,6 +448,92 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streamed_completion_yields_tokens_and_accumulates_tool_calls(self):
+        class FakeStreamingResponse:
+            def __init__(self, lines):
+                self.lines = lines
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+        class FakeStreamContext:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class StreamingClient:
+            def __init__(self):
+                self.response = FakeStreamingResponse([
+                    "data: " + json.dumps({"choices": [{
+                        "delta": {"role": "assistant", "content": "Hello"},
+                        "finish_reason": None,
+                    }]}),
+                    "data: " + json.dumps({"choices": [{
+                        "delta": {"content": " there"},
+                        "finish_reason": None,
+                    }]}),
+                    "data: " + json.dumps({"choices": [{
+                        "delta": {"tool_calls": [{
+                            "index": 0,
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "navigate", "arguments": "{\"url\":"},
+                        }]},
+                        "finish_reason": None,
+                    }]}),
+                    "data: " + json.dumps({"choices": [{
+                        "delta": {"tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": "\"https://example.test\"}"},
+                        }]},
+                        "finish_reason": "tool_calls",
+                    }]}),
+                    "data: [DONE]",
+                ])
+                self.stream = MagicMock(return_value=FakeStreamContext(self.response))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        client = StreamingClient()
+        token_callback = AsyncMock()
+        with (
+            patch.object(config.settings, "LLM_BASE_URL", "https://model.example/v1"),
+            patch.object(config.settings, "LLM_API_KEY", "local-api-key"),
+            patch.object(config.settings, "LLM_MODEL", "nanbeige"),
+            patch("backend.inference.httpx.AsyncClient", return_value=client),
+        ):
+            result = await inference.chat_completion(
+                [{"role": "user", "content": "Hello"}],
+                tools=[{"type": "function"}],
+                stream=True,
+                on_token=token_callback,
+            )
+        self.assertEqual(result["content"], "Hello there")
+        self.assertEqual(result["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(result["tool_calls"][0]["function"]["name"], "navigate")
+        self.assertEqual(
+            result["tool_calls"][0]["function"]["arguments"],
+            "{\"url\":\"https://example.test\"}",
+        )
+        self.assertEqual(
+            [call.args[0] for call in token_callback.await_args_list],
+            ["Hello", " there"],
+        )
+        self.assertTrue(client.stream.call_args.kwargs["json"]["stream"])
+
     async def test_openai_compatible_request_uses_bearer_auth_and_tool_schema(self):
         class SuccessfulClient:
             def __init__(self):

@@ -94,7 +94,7 @@ From the project root, with the virtual environment active:
 python -m backend.main
 ```
 
-Open [http://127.0.0.1:8000/app](http://127.0.0.1:8000/app). The backend JSON health endpoint remains at `/health`, and runtime status is available at `/status`. The browser is headless by default; the interface displays its current URL, title and inspection.
+Open [http://127.0.0.1:8000/app](http://127.0.0.1:8000/app). The backend JSON health endpoint remains at `/health`, and runtime status is available at `/status`. In the browser panel, select **Visible window** to open Chromium on your desktop and interact with it directly; use **Inspect** after a page change to share a fresh observation with the assistant. Select **Headless** to use the original background mode. Agent runs that start their own browser use headless mode. The chat includes up to four recent user/assistant turns for context; that context is reset when the page is reloaded.
 
 Use **Progrentis sign-in** to open the supplied `https://prod.progrentis.com/signin/tabid/1543/Default.aspx` page, or enter another URL explicitly. Inspection includes visible text, headings, links, buttons, input metadata and high-level structure. It does not collect input values. The `Sign in to current page` action is separate from the model and requires explicit confirmation. Sign-in is restricted to the confirmed `https://prod.progrentis.com` origin. It discovers a single visible password field, a matching username field and the labeled sign-in action at runtime, refuses ambiguous forms and human-verification challenges, checks that the form submits to the same origin, and reports only that the form was submitted—not that authentication succeeded.
 
@@ -113,7 +113,8 @@ Tests use mocks for Playwright and the LLM and do not need a Kaggle session or r
 - `POST /browser/start`, `/browser/stop`
 - `POST /browser/navigate` with `{"url":"https://..."}` (HTTP(S) only)
 - `POST /browser/inspect`
-- `POST /agent/run` with `{"prompt":"..."}`; response separates model interpretation from browser observations.
+- `POST /agent/run` with `{"prompt":"...","history":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}`; up to four recent turns are accepted and the response separates interpretation from browser observations.
+- `POST /agent/run/stream` accepts the same payload and streams newline-delimited JSON token, completion, and error events. The GUI uses this endpoint to display generated text as it arrives.
 - `POST /agent/stop` cancels the active run.
 - `POST /progrentis/login` requires the confirmed current origin; credentials are read from `.env`.
 - `POST /progrentis/open-login` opens the supplied Progrentis sign-in page for review.
@@ -125,6 +126,7 @@ The agent caps model iterations and browser tool calls per run. It does not use 
 
 - **Missing LLM settings:** Fill `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` in the root `.env`; verify the tunnel is active and the base URL ends in `/v1`.
 - **LLM timeout/connection refused:** Confirm the Kaggle notebook is running, the Quick Tunnel points to the llama.cpp port, and local network access is available.
+- **HTTP 524 during a streamed response:** Streaming displays output incrementally once the model starts sending tokens, but cannot override a timeout imposed by Cloudflare or the inference provider before the first token.
 - **HTTP 401/403 from inference:** Check that the server API key and local `LLM_API_KEY` match. Never print the key to troubleshoot.
 - **Model responds without tool calls:** Confirm llama.cpp is serving an OpenAI-compatible chat template with tool calling enabled (for example, `--jinja`). Some model/template combinations do not support tools.
 - **Chromium launch failure:** Run `python -m playwright install chromium` on Windows or `python -m playwright install --with-deps chromium` on Fedora.
