@@ -57,6 +57,12 @@ Edit the project-root `.env` file. `.env` is ignored by Git; do not commit it or
 
 Configuration is loaded with `python-dotenv` from the repository root. Start the server again after changing `.env`. Missing LLM settings or account credentials produce a specific configuration error when that feature is used.
 
+## Run the entire agent in Kaggle (no inference tunnel)
+
+For a single-session setup, upload [progrentis_agent_kaggle.ipynb](./progrentis_agent_kaggle.ipynb) to Kaggle and attach the same `nanbeige-4-3-33b-gguf` and `llama-cpp-bin` datasets used by the Nanbeige server notebook. Enable a GPU and Internet access, then run the cells in order. The notebook starts llama.cpp on loopback and runs the existing agent and Playwright browser in that Kaggle runtime; its notebook-widget UI does not expose a public server or use Cloudflare. The browser therefore accesses websites from Kaggle, not from your laptop. Push the latest project source to GitHub `main` or attach it as a Kaggle dataset before starting if it is not already available there.
+
+This removes Cloudflare from the inference path (and so avoids Cloudflare's 524 origin timeout). It does not prevent model/GPU startup failures or make Kaggle's own session and resource limits unlimited.
+
 ## Kaggle llama.cpp inference
 
 1. Attach the Nanbeige 4.3 33B Q4_K_M GGUF to a Kaggle notebook with an enabled GPU.
